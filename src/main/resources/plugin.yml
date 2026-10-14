@@ -1,1 +1,24 @@
-
+name: StickDuels
+version: 1.0.0
+main: com.stickduels.StickDuels
+api-version: '1.21'
+description: Admin-run kit duels in private arenas.
+commands:
+  adminduelrequest:
+    description: Challenge two players to a duel (both must accept)
+    usage: /adminduelrequest <player> <player2> [kit]
+    permission: stickduels.admin
+  duelaccept:
+    description: Accept your duel request
+    usage: /duelaccept
+  dueldeny:
+    description: Decline your duel request
+    usage: /dueldeny
+  adminduel:
+    description: Manage duel kits, arenas and duels
+    usage: /adminduel help
+    permission: stickduels.admin
+permissions:
+  stickduels.admin:
+    description: Manage and start duels
+    default: op
