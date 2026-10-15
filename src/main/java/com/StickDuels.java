@@ -4,9 +4,14 @@ import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Location;
 import org.bukkit.Material;
+import org.bukkit.World;
+import org.bukkit.block.BlockFace;
+import org.bukkit.block.data.BlockData;
+import org.bukkit.block.data.type.Stairs;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
+import org.bukkit.command.TabCompleter;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.Player;
@@ -31,23 +36,29 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.logging.Level;
 
-public final class StickDuels extends JavaPlugin implements Listener, CommandExecutor {
+public final class StickDuels extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
 
     private static final long REQUEST_TIMEOUT_MS = 60_000L;
     private static final int COUNTDOWN_SECONDS = 5;
-    private static final double ARENA_RADIUS = 40.0;
+    private static final double ARENA_RADIUS = 80.0;
     private static final int CONTENTS_SIZE = 41;
+    private static final int ARENA_HALF = 12;
+    private static final int ARENA_SPACING = 260;
+    private static final int ARENA_SPAWN_OFFSET = 40;
 
     private static final class Arena {
         Location spawn1;
         Location spawn2;
+        boolean building;
 
         boolean complete() {
             return spawn1 != null && spawn2 != null;
@@ -103,6 +114,7 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
     private final Map<UUID, Duel> duelOf = new HashMap<>();
     private final Map<UUID, Snapshot> respawnRestore = new HashMap<>();
     private Location lobby;
+    private final Set<UUID> lockBypass = new HashSet<>();
 
     private File kitFile;
     private File arenaFile;
@@ -122,7 +134,10 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
         restores = YamlConfiguration.loadConfiguration(restoreFile);
         getServer().getPluginManager().registerEvents(this, this);
         for (String name : List.of("adminduelrequest", "duelaccept", "dueldeny", "adminduel")) {
-            if (getCommand(name) != null) getCommand(name).setExecutor(this);
+            if (getCommand(name) != null) {
+                getCommand(name).setExecutor(this);
+                getCommand(name).setTabCompleter(this);
+            }
         }
     }
 
@@ -395,7 +410,7 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
             case "list" -> {
                 if (arenas.isEmpty()) { s.sendMessage(ChatColor.GRAY + "No arenas yet."); return; }
                 for (Map.Entry<String, Arena> en : arenas.entrySet()) {
-                    s.sendMessage(ChatColor.GOLD + en.getKey() + ChatColor.GRAY + (en.getValue().complete() ? " ready" : " incomplete"));
+                    s.sendMessage(ChatColor.GOLD + en.getKey() + ChatColor.GRAY + (en.getValue().building ? " building" : en.getValue().complete() ? " ready" : " incomplete"));
                 }
             }
             case "setspawn1", "setspawn2" -> {
@@ -407,6 +422,24 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
                 saveArenas();
                 s.sendMessage(ChatColor.GREEN + "Arena " + args[2] + " " + args[1] + " set." + (a.complete() ? " The arena is ready." : ""));
             }
+            case "generate" -> {
+                if (!(s instanceof Player p)) { s.sendMessage(ChatColor.RED + "Players only."); return; }
+                int count = 1;
+                boolean sky = false;
+                for (int i = 2; i < args.length; i++) {
+                    if (args[i].equalsIgnoreCase("sky")) {
+                        sky = true;
+                        continue;
+                    }
+                    try {
+                        count = Math.max(1, Math.min(10, Integer.parseInt(args[i])));
+                    } catch (NumberFormatException ex) {
+                        s.sendMessage(ChatColor.RED + "Usage: /adminduel arena generate [count] [sky]");
+                        return;
+                    }
+                }
+                generateArenas(p, count, sky);
+            }
             case "delete" -> {
                 if (args.length < 3 || arenas.remove(args[2]) == null) { s.sendMessage(ChatColor.RED + "No arena with that name."); return; }
                 saveArenas();
@@ -414,6 +447,246 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
             }
             default -> s.sendMessage(ChatColor.RED + "Unknown arena subcommand.");
         }
+    }
+
+    private static final int ARENA_R = 55;
+    private static final int SKY_Y = 200;
+    private static final int BLOCKS_PER_TICK = 3000;
+
+    /** One block to place. Blocks are queued, then placed in batches so the server doesn't freeze. */
+    private record Op(World w, int x, int y, int z, Material m, BlockFace facing) {}
+
+    private List<Op> buildQueue = new ArrayList<>();
+
+    private void put(World w, int x, int y, int z, Material m) {
+        buildQueue.add(new Op(w, x, y, z, m, null));
+    }
+
+    private void putStair(World w, int x, int y, int z, Material stair, BlockFace facing) {
+        buildQueue.add(new Op(w, x, y, z, stair, facing));
+    }
+
+    private static BlockFace inward(int x, int z) {
+        if (Math.abs(x) >= Math.abs(z)) return x > 0 ? BlockFace.WEST : BlockFace.EAST;
+        return z > 0 ? BlockFace.NORTH : BlockFace.SOUTH;
+    }
+
+    /** Queues a floating rock underside below the arena floor, tapering as it goes down. */
+    private void buildIsland(World w, int cx, int by, int cz) {
+        int R = ARENA_R;
+        for (int k = 1; k <= 14; k++) {
+            int radius = R - k * 3;
+            if (radius <= 0) break;
+            Material m = k <= 2 ? Material.POLISHED_ANDESITE : (k <= 7 ? Material.STONE : Material.DEEPSLATE);
+            for (int x = -radius; x <= radius; x++) {
+                for (int z = -radius; z <= radius; z++) {
+                    if (x * x + z * z > radius * radius) continue;
+                    put(w, cx + x, by - k, cz + z, m);
+                }
+            }
+        }
+    }
+
+    /** Queues one large themed arena centred on (cx, by, cz). */
+    private void buildArena(World w, int cx, int by, int cz, boolean sky) {
+        int R = ARENA_R;
+
+        if (sky) buildIsland(w, cx, by, cz);
+
+        // Clear the airspace.
+        for (int x = -R - 5; x <= R + 5; x++) {
+            for (int z = -R - 5; z <= R + 5; z++) {
+                if (x * x + z * z > (R + 5) * (R + 5)) continue;
+                for (int y = 1; y <= 26; y++) put(w, cx + x, by + y, cz + z, Material.AIR);
+            }
+        }
+
+        // Moat: a water ring outside the wall on a stone bed.
+        for (int x = -R - 5; x <= R + 5; x++) {
+            for (int z = -R - 5; z <= R + 5; z++) {
+                double d = Math.sqrt(x * x + z * z);
+                if (d <= R + 2 || d > R + 4) continue;
+                put(w, cx + x, by - 1, cz + z, Material.STONE_BRICKS);
+                put(w, cx + x, by, cz + z, Material.WATER);
+            }
+        }
+
+        // Floor: inner polished checker, gold inlay ring, outer prismarine checker, chiselled rim, sea lantern grid.
+        for (int x = -R; x <= R; x++) {
+            for (int z = -R; z <= R; z++) {
+                double d = Math.sqrt(x * x + z * z);
+                if (d > R) continue;
+                Material m;
+                if (d > R - 1.5) m = Material.CHISELED_STONE_BRICKS;
+                else if (d >= 20 && d < 21) m = Material.GOLD_BLOCK;
+                else if (d < 20) m = ((x + z) & 1) == 0 ? Material.POLISHED_ANDESITE : Material.STONE_BRICKS;
+                else m = ((x + z) & 1) == 0 ? Material.PRISMARINE_BRICKS : Material.DARK_PRISMARINE;
+                if (m != Material.GOLD_BLOCK && x % 12 == 0 && z % 12 == 0 && d < R - 3) m = Material.SEA_LANTERN;
+                put(w, cx + x, by, cz + z, m);
+            }
+        }
+
+        // Amethyst clusters around the rim.
+        for (int k = 0; k < 24; k++) {
+            double ang = Math.toRadians(7.5 + 15 * k);
+            int ax = (int) Math.round((R - 3) * Math.cos(ang));
+            int az = (int) Math.round((R - 3) * Math.sin(ang));
+            put(w, cx + ax, by + 1, cz + az, Material.AMETHYST_CLUSTER);
+        }
+
+        // Crenellated outer wall, with lanterns on the tall sections.
+        for (int x = -R - 2; x <= R + 2; x++) {
+            for (int z = -R - 2; z <= R + 2; z++) {
+                double d = Math.sqrt(x * x + z * z);
+                if (d <= R || d > R + 1.2) continue;
+                boolean tall = (Math.abs(x) + Math.abs(z)) % 2 == 0;
+                int h = tall ? 5 : 2;
+                for (int y = 1; y <= h; y++) put(w, cx + x, by + y, cz + z, Material.STONE_BRICK_WALL);
+                if (tall && (Math.abs(x) + Math.abs(z)) % 12 == 0) put(w, cx + x, by + 6, cz + z, Material.LANTERN);
+            }
+        }
+
+        // Four gates: a stone bridge over the moat, a gap in the wall, two pillars, a lintel and a lantern.
+        int[][] dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (int[] dir : dirs) {
+            int dx = dir[0], dz = dir[1];
+            int lx = -dz, lz = dx;
+            for (int s = R + 2; s <= R + 4; s++) {
+                for (int l = -2; l <= 2; l++) {
+                    put(w, cx + dx * s + lx * l, by, cz + dz * s + lz * l, Material.STONE_BRICKS);
+                }
+            }
+            int sx = dx * (R + 1), sz = dz * (R + 1);
+            for (int l = -2; l <= 2; l++) {
+                int gx = cx + sx + lx * l, gz = cz + sz + lz * l;
+                if (Math.abs(l) <= 1) {
+                    for (int y = 1; y <= 4; y++) put(w, gx, by + y, gz, Material.AIR);
+                    put(w, gx, by + 5, gz, Material.STONE_BRICKS);
+                } else {
+                    for (int y = 1; y <= 6; y++) put(w, gx, by + y, gz, Material.POLISHED_DEEPSLATE);
+                }
+            }
+            put(w, cx + sx, by + 4, cz + sz, Material.LANTERN);
+        }
+
+        // Cover: twelve quartz pillars with lanterns on a ring between the centre and the spawns.
+        for (int k = 0; k < 12; k++) {
+            double ang = Math.toRadians(15 + 30 * k);
+            int px = (int) Math.round(28 * Math.cos(ang));
+            int pz = (int) Math.round(28 * Math.sin(ang));
+            for (int y = 1; y <= 6; y++) put(w, cx + px, by + y, cz + pz, Material.QUARTZ_PILLAR);
+            put(w, cx + px, by + 7, cz + pz, Material.LANTERN);
+        }
+
+        // Tier one: polished platform with stairs all round.
+        for (int x = -13; x <= 13; x++) {
+            for (int z = -13; z <= 13; z++) {
+                double d = Math.sqrt(x * x + z * z);
+                if (d <= 12) put(w, cx + x, by + 1, cz + z, Material.POLISHED_ANDESITE);
+                else if (d <= 13) putStair(w, cx + x, by + 1, cz + z, Material.STONE_BRICK_STAIRS, inward(x, z));
+            }
+        }
+        // Tier two: quartz platform with stairs, a beacon-style light on top.
+        for (int x = -8; x <= 8; x++) {
+            for (int z = -8; z <= 8; z++) {
+                double d = Math.sqrt(x * x + z * z);
+                if (d <= 7) put(w, cx + x, by + 2, cz + z, Material.QUARTZ_BLOCK);
+                else if (d <= 8) putStair(w, cx + x, by + 2, cz + z, Material.QUARTZ_STAIRS, inward(x, z));
+            }
+        }
+        put(w, cx, by + 3, cz, Material.SEA_LANTERN);
+
+        // Four tall corner towers with balconies, crenellated tops, lanterns and coloured banners.
+        int tower = (int) Math.round(R * 0.72);
+        Material[] banners = {Material.RED_WOOL, Material.BLUE_WOOL, Material.YELLOW_WOOL, Material.GREEN_WOOL};
+        int bi = 0;
+        for (int sx : new int[]{-1, 1}) {
+            for (int sz : new int[]{-1, 1}) {
+                int tx = cx + sx * tower;
+                int tz = cz + sz * tower;
+                for (int dx = -1; dx <= 1; dx++) {
+                    for (int dz = -1; dz <= 1; dz++) {
+                        for (int y = 1; y <= 26; y++) put(w, tx + dx, by + y, tz + dz, Material.DEEPSLATE_TILES);
+                        put(w, tx + dx, by + 14, tz + dz, Material.POLISHED_DEEPSLATE);
+                        put(w, tx + dx, by + 27, tz + dz, Material.POLISHED_DEEPSLATE);
+                    }
+                }
+                for (int dx = -1; dx <= 1; dx++) {
+                    for (int dz = -1; dz <= 1; dz++) {
+                        if (dx == 0 && dz == 0) continue;
+                        put(w, tx + dx, by + 28, tz + dz, Material.COBBLESTONE_WALL);
+                    }
+                }
+                put(w, tx, by + 28, tz, Material.LANTERN);
+                for (int dx = -2; dx <= 2; dx++) {
+                    for (int dz = -2; dz <= 2; dz++) {
+                        if (Math.abs(dx) == 2 || Math.abs(dz) == 2) put(w, tx + dx, by + 15, tz + dz, Material.STONE_BRICK_SLAB);
+                    }
+                }
+                for (int y = 29; y <= 31; y++) put(w, tx, by + y, tz, Material.OAK_FENCE);
+                put(w, tx, by + 32, tz, banners[bi++ % banners.length]);
+            }
+        }
+    }
+
+    /** Places queued blocks in batches over several ticks, then marks the arenas ready. */
+    private void startBuild(Player admin, List<Op> ops, List<Arena> built, List<String> names) {
+        new BukkitRunnable() {
+            int i = 0;
+
+            @Override
+            public void run() {
+                int end = Math.min(ops.size(), i + BLOCKS_PER_TICK);
+                for (; i < end; i++) {
+                    Op op = ops.get(i);
+                    if (op.facing() == null) {
+                        op.w().getBlockAt(op.x(), op.y(), op.z()).setType(op.m(), false);
+                    } else {
+                        BlockData bd = op.m().createBlockData();
+                        if (bd instanceof Stairs st) st.setFacing(op.facing());
+                        op.w().getBlockAt(op.x(), op.y(), op.z()).setBlockData(bd, false);
+                    }
+                }
+                if (i >= ops.size()) {
+                    for (Arena a : built) a.building = false;
+                    if (admin.isOnline()) admin.sendMessage(ChatColor.GREEN + "Finished building " + String.join(", ", names) + ". They are ready for duels.");
+                    cancel();
+                }
+            }
+        }.runTaskTimer(this, 1L, 1L);
+    }
+
+    /** Builds arenas (named arena1, arena2, ...) starting where the admin stands, or high in the sky if sky is set. */
+    private void generateArenas(Player p, int count, boolean sky) {
+        World w = p.getWorld();
+        int baseX = p.getLocation().getBlockX();
+        int baseZ = p.getLocation().getBlockZ();
+        int baseY = sky ? SKY_Y : p.getLocation().getBlockY() - 1;
+        buildQueue = new ArrayList<>();
+        int next = 1;
+        List<String> names = new ArrayList<>();
+        List<Arena> built = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            while (arenas.containsKey("arena" + next)) next++;
+            String name = "arena" + next;
+            next++;
+            int cx = baseX + i * ARENA_SPACING;
+            buildArena(w, cx, baseY, baseZ, sky);
+            Arena a = new Arena();
+            a.spawn1 = new Location(w, cx - ARENA_SPAWN_OFFSET + 0.5, baseY + 1, baseZ + 0.5, 90f, 0f);
+            a.spawn2 = new Location(w, cx + ARENA_SPAWN_OFFSET + 0.5, baseY + 1, baseZ + 0.5, -90f, 0f);
+            a.building = true;
+            arenas.put(name, a);
+            names.add(name);
+            built.add(a);
+        }
+        List<Op> ops = buildQueue;
+        buildQueue = new ArrayList<>();
+        saveArenas();
+        startBuild(p, ops, built, names);
+        p.sendMessage(ChatColor.GOLD + "Building " + names.size() + " arena(s): " + String.join(", ", names)
+                + (sky ? " high in the sky" : "") + ". This runs in batches and may take a little while. "
+                + "Duels can start once it finishes.");
     }
 
     private void sendHelp(CommandSender s) {
@@ -424,9 +697,45 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
         s.sendMessage(ChatColor.WHITE + "/adminduel removekit <name>" + ChatColor.GRAY + " - delete a kit");
         s.sendMessage(ChatColor.WHITE + "/adminduel listkits" + ChatColor.GRAY + " - list kits");
         s.sendMessage(ChatColor.WHITE + "/adminduel arena setspawn1|setspawn2 <name>" + ChatColor.GRAY + " - set arena spawns where you stand");
+        s.sendMessage(ChatColor.WHITE + "/adminduel arena generate [count] [sky]" + ChatColor.GRAY + " - build arenas (arena1, arena2, ...) from where you stand, or high in the sky");
         s.sendMessage(ChatColor.WHITE + "/adminduel arena list|delete <name>" + ChatColor.GRAY + " - manage arenas");
         s.sendMessage(ChatColor.WHITE + "/adminduel setlobby" + ChatColor.GRAY + " - where non-operators are sent if they wander into an arena");
         s.sendMessage(ChatColor.WHITE + "/adminduel forceend <player>" + ChatColor.GRAY + " - end a duel and restore both players");
+    }
+
+    // ---------- Tab suggestions ----------
+
+    private List<String> onlineNames() {
+        List<String> out = new ArrayList<>();
+        for (Player p : Bukkit.getOnlinePlayers()) out.add(p.getName());
+        return out;
+    }
+
+    private static List<String> filter(List<String> options, String prefix) {
+        String p = prefix.toLowerCase(Locale.ROOT);
+        return options.stream().filter(o -> o.toLowerCase(Locale.ROOT).startsWith(p)).toList();
+    }
+
+    @Override
+    public List<String> onTabComplete(CommandSender s, Command cmd, String alias, String[] args) {
+        if (!isAdmin(s)) return List.of();
+        String name = cmd.getName().toLowerCase(Locale.ROOT);
+        if (name.equals("adminduelrequest")) {
+            if (args.length == 1 || args.length == 2) return filter(onlineNames(), args[args.length - 1]);
+            if (args.length == 3) return filter(new ArrayList<>(kits.keySet()), args[2]);
+            return List.of();
+        }
+        if (name.equals("adminduel")) {
+            if (args.length == 1) return filter(List.of("help", "addkit", "removekit", "listkits", "arena", "setlobby", "forceend"), args[0]);
+            String sub = args[0].toLowerCase(Locale.ROOT);
+            if (sub.equals("removekit") && args.length == 2) return filter(new ArrayList<>(kits.keySet()), args[1]);
+            if (sub.equals("forceend") && args.length == 2) return filter(onlineNames(), args[1]);
+            if (sub.equals("arena")) {
+                if (args.length == 2) return filter(List.of("generate", "setspawn1", "setspawn2", "list", "delete"), args[1]);
+                if (args.length == 3) return filter(new ArrayList<>(arenas.keySet()), args[2]);
+            }
+        }
+        return List.of();
     }
 
     // ---------- Requests ----------
@@ -462,7 +771,7 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
 
     private Arena freeArena() {
         for (Arena a : arenas.values()) {
-            if (!a.complete()) continue;
+            if (!a.complete() || a.building) continue;
             boolean used = false;
             for (Duel d : duels) if (d.arena == a) used = true;
             if (!used) return a;
@@ -474,7 +783,7 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
         Player a = Bukkit.getPlayer(r.a);
         Player b = Bukkit.getPlayer(r.b);
         Arena arena = freeArena();
-        if (a == null || b == null || arena == null) {
+        if (a == null || b == null || arena == null || kits.get(r.kit) == null) {
             notifyPlayer(r.a, ChatColor.RED + "The duel could not start.");
             notifyPlayer(r.b, ChatColor.RED + "The duel could not start.");
             return;
@@ -566,7 +875,11 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
         p.setFoodLevel(20);
         p.setSaturation(20f);
         p.setFireTicks(0);
-        if (s.origin() != null) p.teleport(s.origin());
+        if (s.origin() != null) {
+            lockBypass.add(p.getUniqueId());
+            p.teleport(s.origin());
+            lockBypass.remove(p.getUniqueId());
+        }
     }
 
     private void saveRestore(UUID id, Snapshot s) {
@@ -581,6 +894,7 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
         if (!a.complete() || l == null || l.getWorld() == null || !l.getWorld().equals(a.spawn1.getWorld())) return false;
         double cx = (a.spawn1.getX() + a.spawn2.getX()) / 2.0;
         double cz = (a.spawn1.getZ() + a.spawn2.getZ()) / 2.0;
+        if (Math.abs(l.getY() - a.spawn1.getY()) > 60) return false;
         return Math.hypot(l.getX() - cx, l.getZ() - cz) <= ARENA_RADIUS;
     }
 
@@ -607,7 +921,7 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
             }
             return;
         }
-        if (p.isOp() || !insideAnyArena(e.getTo())) return;
+        if (p.isOp() || lockBypass.contains(p.getUniqueId()) || !insideAnyArena(e.getTo())) return;
         e.setTo(lobbyLocation());
         p.sendMessage(ChatColor.RED + "That arena is in use by a duel.");
     }
@@ -615,7 +929,7 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
     @EventHandler(priority = EventPriority.HIGH)
     public void onTeleport(PlayerTeleportEvent e) {
         Player p = e.getPlayer();
-        if (p.isOp() || duelOf.containsKey(p.getUniqueId()) || e.getTo() == null) return;
+        if (p.isOp() || duelOf.containsKey(p.getUniqueId()) || lockBypass.contains(p.getUniqueId()) || e.getTo() == null) return;
         if (insideAnyArena(e.getTo())) {
             e.setCancelled(true);
             p.sendMessage(ChatColor.RED + "You cannot enter a duel arena.");
