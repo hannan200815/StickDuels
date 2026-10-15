@@ -1189,11 +1189,6 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
                 warn(p, ChatColor.YELLOW + "A duel is happening, kindly step behind.");
                 return;
             }
-            if (!isInDuel(a) && within(a, to, ARENA_RADIUS)) {
-                e.setTo(lobbyLocation());
-                p.sendMessage(ChatColor.RED + "That arena is closed to players.");
-                return;
-            }
         }
     }
 
@@ -1300,6 +1295,7 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onArenaBreak(BlockBreakEvent e) {
+        if (e.getPlayer().isOp()) return;
         if (insideAnyArena(e.getBlock().getLocation())) e.setCancelled(true);
     }
 
