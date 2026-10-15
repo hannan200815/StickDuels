@@ -666,7 +666,7 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
     }
 
     private boolean insideAnyArena(Location l) {
-        for (Arena a : arenas.values()) if (within(a, l, ARENA_RADIUS)) return true;
+        for (Arena a : arenas.values()) if (within(a, l, ARENA_R + 6)) return true;
         return false;
     }
 
@@ -1075,8 +1075,8 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
             viewable.put(id, new ViewData(oppName == null ? "opponent" : oppName, oppItems, System.currentTimeMillis() + VIEW_TIMEOUT_MS));
             Player p = Bukkit.getPlayer(id);
             if (p != null) {
-                p.sendMessage(Component.text("[Click to view " + (oppName == null ? "your opponent" : oppName) + "'s items and durability]", NamedTextColor.GOLD)
-                        .clickEvent(ClickEvent.runCommand("/duelview"))
+                p.sendMessage(Component.text("[Click here, then press Enter to view " + (oppName == null ? "your opponent" : oppName) + "'s items and durability]", NamedTextColor.GOLD)
+                        .clickEvent(ClickEvent.suggestCommand("/duelview"))
                         .hoverEvent(HoverEvent.showText(Component.text("Opens a read-only view of their final inventory"))));
             }
         }
@@ -1300,16 +1300,6 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onArenaBreak(BlockBreakEvent e) {
-        if (insideAnyArena(e.getBlock().getLocation())) e.setCancelled(true);
-    }
-
-    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
-    public void onArenaPlace(BlockPlaceEvent e) {
-        if (insideAnyArena(e.getBlock().getLocation())) e.setCancelled(true);
-    }
-
-    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
-    public void onArenaBucket(PlayerBucketEmptyEvent e) {
         if (insideAnyArena(e.getBlock().getLocation())) e.setCancelled(true);
     }
 
