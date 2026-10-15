@@ -226,7 +226,7 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
 
     private static ItemStack weapon(Material m, Enchantment e, int lvl) {
         ItemStack it = new ItemStack(m);
-        if (e != null) it.addEnchantment(e, lvl);
+        if (e != null) it.addUnsafeEnchantment(e, lvl);
         return it;
     }
 
@@ -255,8 +255,8 @@ public final class StickDuels extends JavaPlugin implements Listener, CommandExe
         m.put("Mace", buildKit(List.of(new ItemStack(Material.MACE), new ItemStack(Material.GOLDEN_APPLE, 8)), netherite, true));
         m.put("Spear", buildKit(List.of(weapon(spearMat, Enchantment.SHARPNESS, 5), new ItemStack(Material.GOLDEN_APPLE, 8)), netherite, true));
         ItemStack bow = new ItemStack(Material.BOW);
-        bow.addEnchantment(Enchantment.POWER, 5);
-        bow.addEnchantment(Enchantment.INFINITY, 1);
+        bow.addUnsafeEnchantment(Enchantment.POWER, 5);
+        bow.addUnsafeEnchantment(Enchantment.INFINITY, 1);
         m.put("Archer", buildKit(List.of(bow, weapon(Material.DIAMOND_SWORD, Enchantment.SHARPNESS, 4), new ItemStack(Material.ARROW, 1), new ItemStack(Material.GOLDEN_APPLE, 8)), diamond, false));
         m.put("Sumo", buildKit(List.of(weapon(Material.STICK, Enchantment.KNOCKBACK, 2)), null, false));
         return m;
